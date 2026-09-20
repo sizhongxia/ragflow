@@ -4,14 +4,21 @@ import { EmptyAppCard } from '@/components/empty/empty';
 import ListFilterBar from '@/components/list-filter-bar';
 import { Button } from '@/components/ui/button';
 import { RAGFlowPagination } from '@/components/ui/ragflow-pagination';
+import { ListDeletionKey } from '@/constants/list-deletion';
 import { useTranslate } from '@/hooks/common-hooks';
+import { useGoToPreviousPageOnEmpty } from '@/hooks/logic-hooks';
 import { pick } from 'lodash';
 import { Plus } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router';
 import { AddOrEditModal } from './add-or-edit-modal';
 import { defaultMemoryFields } from './constants';
-import { useFetchMemoryList, useRenameMemory, useSelectFilters } from './hooks';
+import {
+  useFetchMemoryFilters,
+  useFetchMemoryList,
+  useRenameMemory,
+  useSelectFilters,
+} from './hooks';
 import { ICreateMemoryProps, IMemory } from './interface';
 import { MemoryCard } from './memory-card';
 
@@ -22,14 +29,18 @@ export default function MemoryList() {
   // const [isEdit, setIsEdit] = useState(false);
   const {
     data: list,
+    isLoading,
     pagination,
     searchString,
+    setSearchString,
     handleInputChange,
     setPagination,
     refetch: refetchList,
     filterValue,
+    setFilterValue,
     handleFilterSubmit,
   } = useFetchMemoryList();
+  const { data: filterData } = useFetchMemoryFilters();
 
   const {
     openCreateModal,
@@ -56,9 +67,16 @@ export default function MemoryList() {
     },
     [setPagination],
   );
+  useGoToPreviousPageOnEmpty(list?.data?.memory_list?.length, isLoading, {
+    deletionKey: ListDeletionKey.MemoryList,
+    searchString,
+    setSearchString,
+    filterValue,
+    setFilterValue,
+  });
 
   const [searchUrl, setMemoryUrl] = useSearchParams();
-  const { filters } = useSelectFilters();
+  const { filters } = useSelectFilters(filterData);
   const isCreate = searchUrl.get('isCreate') === 'true';
   useEffect(() => {
     if (isCreate) {
@@ -71,8 +89,11 @@ export default function MemoryList() {
   return (
     <>
       {list?.data?.memory_list?.length || searchString ? (
-        <article className="size-full flex flex-col" data-testid="memory-list">
-          <header className="px-5 pt-8 mb-4">
+        <article
+          className="size-full min-w-0 flex flex-col"
+          data-testid="memory-list"
+        >
+          <header className="mb-4 min-w-0 px-5 pt-8">
             <ListFilterBar
               icon="memory"
               title={t('memory')}
@@ -113,11 +134,10 @@ export default function MemoryList() {
               </footer>
             </>
           ) : (
-            <div className="flex-1 flex items-center justify-center">
+            <div className="flex flex-1 items-center justify-center px-5">
               <EmptyAppCard
                 showIcon
                 size="large"
-                className="w-[480px] p-14"
                 isSearch
                 type={EmptyCardType.Memory}
                 onClick={() => openCreateModalFun()}
@@ -127,13 +147,12 @@ export default function MemoryList() {
         </article>
       ) : (
         <article
-          className="size-full flex items-center justify-center"
+          className="size-full min-w-0 flex items-center justify-center px-5"
           data-testid="memory-list"
         >
           <EmptyAppCard
             showIcon
             size="large"
-            className="w-[480px] p-14"
             type={EmptyCardType.Memory}
             onClick={() => openCreateModalFun()}
           />

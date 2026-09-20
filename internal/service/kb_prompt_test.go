@@ -2,6 +2,8 @@ package service
 
 import (
 	"testing"
+
+	"ragflow/internal/tokenizer"
 )
 
 func TestKbPrompt_Empty(t *testing.T) {
@@ -30,9 +32,13 @@ func TestKbPrompt_Format(t *testing.T) {
 	if result == "" {
 		t.Fatal("expected non-empty prompt")
 	}
-	// Verify ID appears
-	if !contains(result, "ID: abc") {
+	// The ID line carries the chunk's position, not its chunk id: the client
+	// resolves a citation marker by indexing the reference with that number.
+	if !contains(result, "ID: 0") {
 		t.Errorf("missing ID line: %s", result)
+	}
+	if contains(result, "ID: abc") {
+		t.Errorf("the block id must be the chunk position, not the chunk id: %s", result)
 	}
 	// Verify title
 	if !contains(result, "Title: Test Document") {
@@ -59,13 +65,13 @@ func TestKbPrompt_TokenLimit(t *testing.T) {
 	}
 	// Compute limit dynamically so the test works with both the C++
 	// tokenizer and the rune-based fallback.
-	entryTokens := NumTokensFromString(formatChunkEntry(chunks[0]))
+	entryTokens := tokenizer.NumTokensFromString(formatChunkEntry(chunks[0], 0))
 	maxToks := int(float64(entryTokens+1) / 0.97) // just enough for first
 	result := KbPrompt(chunks, maxToks)
-	if !contains(result, "ID: 1") {
+	if !contains(result, "ID: 0") {
 		t.Error("first chunk should be included")
 	}
-	if contains(result, "ID: 2") {
+	if contains(result, "ID: 1") {
 		t.Error("second chunk should be excluded under tight limit")
 	}
 }
@@ -102,8 +108,6 @@ func TestKbPrompt_NoDocNameOrURL(t *testing.T) {
 	}
 }
 
-
-
 func contains(s, substr string) bool {
 	for i := 0; i <= len(s)-len(substr); i++ {
 		if s[i:i+len(substr)] == substr {
@@ -113,39 +117,21 @@ func contains(s, substr string) bool {
 	return false
 }
 
-
-
-func TestNumTokensFromString_Empty(t *testing.T) {
-	if got := NumTokensFromString(""); got != 0 {
-		t.Errorf("expected 0 for empty string, got %d", got)
-	}
-}
-
-func TestNumTokensFromString_Positive(t *testing.T) {
-	// Either the C++ tokenizer or the fallback must return > 0 for
-	// non-empty text.  The exact count depends on the environment.
-	for _, s := range []string{"hello world", "你好世界"} {
-		if got := NumTokensFromString(s); got <= 0 {
-			t.Errorf("NumTokensFromString(%q) = %d, want >0", s, got)
-		}
-	}
-}
-
 func TestKbPrompt_TokenLimitAccurate(t *testing.T) {
-	// Verify truncation uses NumTokensFromString by computing the limit
+	// Verify truncation uses tokenizer.NumTokensFromString by computing the limit
 	// dynamically from the actual token count (works in both fallback
 	// and C++ tokenizer environments).
 	chunks := []SourcedChunk{
 		{ID: "1", Content: "hello"},
 		{ID: "2", Content: "world"},
 	}
-	entryTokens := NumTokensFromString(formatChunkEntry(chunks[0]))
+	entryTokens := tokenizer.NumTokensFromString(formatChunkEntry(chunks[0], 0))
 	maxToks := int(float64(entryTokens+1) / 0.97) // just enough for first entry
 	result := KbPrompt(chunks, maxToks)
-	if !contains(result, "ID: 1") {
+	if !contains(result, "ID: 0") {
 		t.Error("first chunk should fit")
 	}
-	if contains(result, "ID: 2") {
+	if contains(result, "ID: 1") {
 		t.Errorf("second chunk should be excluded: result = %q", result)
 	}
 }
@@ -156,9 +142,7 @@ func TestKbPrompt_AllFit(t *testing.T) {
 		{ID: "2", Content: "b"},
 	}
 	result := KbPrompt(chunks, 1000)
-	if !contains(result, "ID: 1") || !contains(result, "ID: 2") {
+	if !contains(result, "ID: 0") || !contains(result, "ID: 1") {
 		t.Error("both chunks should fit under generous limit")
 	}
 }
-
-

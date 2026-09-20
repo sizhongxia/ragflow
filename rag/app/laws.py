@@ -16,56 +16,85 @@
 
 import logging
 import re
+from html import escape as html_escape
 from io import BytesIO
-from docx import Document
 
-from common.constants import ParserType, MAXIMUM_PAGE_NUMBER
-from deepdoc.parser.utils import get_text
-from rag.nlp import bullets_category, remove_contents_table, make_colon_as_title, tokenize_chunks, docx_question_level, tree_merge
-from rag.nlp import rag_tokenizer, Node
-from deepdoc.parser import PdfParser, DocxParser, HtmlParser
-from rag.app.naive import by_plaintext, PARSERS
+from docx import Document
+from docx.table import Table as DocxTable
+from docx.text.paragraph import Paragraph
+
+from api.db.joint_services.tenant_model_service import get_composite_model_name_by_id
+from common.constants import MAXIMUM_PAGE_NUMBER, ParserType
 from common.parser_config_utils import normalize_layout_recognizer
+from deepdoc.parser import DocxParser, HtmlParser, PdfParser
+from deepdoc.parser.utils import get_text
+from rag.app.naive import PARSERS, by_plaintext
+from rag.nlp import DEFAULT_DELIMITER, Node, bullets_category, docx_question_level, make_colon_as_title, rag_tokenizer, remove_contents_table, tokenize_chunks, tree_merge
 
 
 class Docx(DocxParser):
     def __init__(self):
         pass
 
-    def __clean(self, line):
-        line = re.sub(r"\u3000", " ", line).strip()
-        return line
-
-    def old_call(self, filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER):
-        self.doc = Document(filename) if not binary else Document(BytesIO(binary))
-        pn = 0
-        lines = []
-        for p in self.doc.paragraphs:
-            if pn > to_page:
-                break
-            if from_page <= pn < to_page and p.text.strip():
-                lines.append(self.__clean(p.text))
-            for run in p.runs:
-                if "lastRenderedPageBreak" in run._element.xml:
-                    pn += 1
-                    continue
-                if "w:br" in run._element.xml and 'type="page"' in run._element.xml:
-                    pn += 1
-        return [line for line in lines if line]
+    def __table_to_html(self, tb):
+        html = "<table>"
+        for r in tb.rows:
+            html += "<tr>"
+            col_idx = 0
+            try:
+                while col_idx < len(r.cells):
+                    span = 1
+                    c = r.cells[col_idx]
+                    for j in range(col_idx + 1, len(r.cells)):
+                        if c.text == r.cells[j].text:
+                            span += 1
+                            col_idx = j
+                        else:
+                            break
+                    col_idx += 1
+                    cell = html_escape(c.text)
+                    html += f"<td>{cell}</td>" if span == 1 else f"<td colspan='{span}'>{cell}</td>"
+            except Exception as e:
+                logging.warning(f"Error parsing table, ignore: {e}")
+            html += "</tr>"
+        html += "</table>"
+        return html
 
     def __call__(self, filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER):
-        self.doc = Document(filename) if not binary else Document(BytesIO(binary))
+        self.doc = Document(filename) if binary is None else Document(BytesIO(binary))
         pn = 0
         lines = []
         level_set = set()
         bull = bullets_category([p.text for p in self.doc.paragraphs])
-        for p in self.doc.paragraphs:
+        # Tables carry no heading level; assign a sentinel deeper than any heading so
+        # build_tree merges them into the enclosing section as leaf content (keeping the
+        # section's title path as retrieval context) instead of dropping them.
+        table_level = 10**6
+        # Iterate over the document body so tables are visited in order alongside
+        # paragraphs (self.doc.paragraphs only yields paragraph elements, skipping tables).
+        for block in self.doc._element.body:
             if pn > to_page:
                 break
+
+            if block.tag.endswith("tbl"):
+                html = self.__table_to_html(DocxTable(block, self.doc))
+                if html:
+                    lines.append((table_level, html))
+                continue
+
+            if not block.tag.endswith("p"):
+                continue
+
+            p = Paragraph(block, self.doc)
             question_level, p_text = docx_question_level(p, bull)
+            # A text box carries no heading level either, so it gets the same sentinel
+            # as a table and stays leaf content of the enclosing section.
+            text_boxes = [(table_level, box_text) for box_text in self.extract_text_boxes(p)]
             if not p_text.strip("\n"):
+                lines.extend(text_boxes)
                 continue
             lines.append((question_level, p_text))
+            lines.extend(text_boxes)
             level_set.add(question_level)
             for run in p.runs:
                 if "lastRenderedPageBreak" in run._element.xml:
@@ -76,8 +105,11 @@ class Docx(DocxParser):
 
         sorted_levels = sorted(level_set)
 
-        h2_level = sorted_levels[1] if len(sorted_levels) > 1 else 1
-        h2_level = sorted_levels[-2] if h2_level == sorted_levels[-1] and len(sorted_levels) > 2 else h2_level
+        if not sorted_levels:
+            h2_level = 1
+        else:
+            h2_level = sorted_levels[1] if len(sorted_levels) > 1 else 1
+            h2_level = sorted_levels[-2] if h2_level == sorted_levels[-1] and len(sorted_levels) > 2 else h2_level
 
         root = Node(level=0, depth=h2_level, texts=[])
         root.build_tree(lines)
@@ -103,16 +135,16 @@ class Pdf(PdfParser):
 
         start = timer()
         callback(msg="OCR started")
-        self.__images__(filename if not binary else binary, zoomin, from_page, to_page, callback)
-        callback(msg="OCR finished ({:.2f}s)".format(timer() - start))
+        self.__images__(filename if binary is None else binary, zoomin, from_page, to_page, callback)
+        callback(msg=f"OCR finished ({timer() - start:.2f}s)")
 
         start = timer()
         self._layouts_rec(zoomin)
-        callback(0.67, "Layout analysis ({:.2f}s)".format(timer() - start))
-        logging.debug("layouts: {}".format((timer() - start)))
+        callback(0.67, f"Layout analysis ({timer() - start:.2f}s)")
+        logging.debug(f"layouts: {timer() - start}")
         self._naive_vertical_merge()
 
-        callback(0.8, "Text extraction ({:.2f}s)".format(timer() - start))
+        callback(0.8, f"Text extraction ({timer() - start:.2f}s)")
 
         return [(b["text"], self._line_tag(b, zoomin)) for b in self.boxes], None
 
@@ -121,7 +153,7 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
     """
     Supported file formats are docx, pdf, txt.
     """
-    parser_config = kwargs.get("parser_config", {"chunk_token_num": 512, "delimiter": "\n!?。；！？", "layout_recognize": "DeepDOC"})
+    parser_config = kwargs.get("parser_config", {"chunk_token_num": 512, "delimiter": DEFAULT_DELIMITER, "layout_recognize": "DeepDOC"})
     doc = {"docnm_kwd": filename, "title_tks": rag_tokenizer.tokenize(re.sub(r"\.[a-zA-Z]+$", "", filename))}
     doc["title_sm_tks"] = rag_tokenizer.fine_grained_tokenize(doc["title_tks"])
     pdf_parser = None
@@ -133,10 +165,17 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
         callback(0.1, "Start to parse.")
         chunks = Docx()(filename, binary)
         callback(0.7, "Finish parsing.")
-        return tokenize_chunks(chunks, doc, eng, None)
+        return tokenize_chunks(chunks, doc, eng, None, language=lang)
 
     elif re.search(r"\.pdf$", filename, re.IGNORECASE):
-        layout_recognizer, parser_model_name = normalize_layout_recognizer(parser_config.get("layout_recognize", "DeepDOC"))
+        layout_recognize_raw = parser_config.get("layout_recognize", "DeepDOC")
+        tenant_id = kwargs.get("tenant_id")
+        if tenant_id and isinstance(layout_recognize_raw, str):
+            try:
+                layout_recognize_raw = get_composite_model_name_by_id(layout_recognize_raw)
+            except LookupError:
+                pass
+        layout_recognizer, parser_model_name = normalize_layout_recognizer(layout_recognize_raw)
 
         if isinstance(layout_recognizer, bool):
             layout_recognizer = "DeepDOC" if layout_recognizer else "Plain Text"
@@ -155,6 +194,7 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
             pdf_cls=Pdf,
             layout_recognizer=layout_recognizer,
             mineru_llm_name=parser_model_name,
+            mistral_ocr_llm_name=parser_model_name,
             paddleocr_llm_name=parser_model_name,
             **kwargs,
         )
@@ -214,7 +254,7 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
     if not res:
         callback(0.99, "No chunk parsed out.")
 
-    return tokenize_chunks(res, doc, eng, pdf_parser)
+    return tokenize_chunks(res, doc, eng, pdf_parser, language=lang)
 
     # chunks = hierarchical_merge(bull, sections, 5)
     #     return tokenize_chunks(["\n".join(ck)for ck in chunks], doc, eng, pdf_parser)
